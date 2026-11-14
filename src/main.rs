@@ -228,11 +228,22 @@ fn pool_status(accounts: &[&AuthRuntimeAccount], configuration: &Configuration) 
     let mut output = format!("账号池状态：{healthy} 正常 / {abnormal} 异常 / 共 {} 个\n\n", accounts.len());
     for account in accounts {
         let state = effective_state(account);
-        let label = account_label(account, configuration);
+        let email = account.email.as_deref().unwrap_or(&account.name);
+        let note = configuration
+            .account_labels
+            .get(&account.account_id)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty());
         if is_healthy(&state) {
-            output.push_str(&format!("✅ {label}\n"));
+            match note {
+                Some(note) => output.push_str(&format!("✅ {email}（{note}）\n")),
+                None => output.push_str(&format!("✅ {email}\n")),
+            }
         } else {
-            output.push_str(&format!("❌ {label}（{state}）\n"));
+            match note {
+                Some(note) => output.push_str(&format!("❌ {email}（{note}，{state}）\n")),
+                None => output.push_str(&format!("❌ {email}（{state}）\n")),
+            }
         }
     }
     output.trim_end().to_owned()
