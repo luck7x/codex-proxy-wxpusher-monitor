@@ -18,7 +18,8 @@ use std::{collections::BTreeMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 const PLUGIN_ID: &str = "luck7x.wxpusher-account-monitor";
 const STATE_NAMESPACE: &str = "monitor";
 const STATE_KEY: &str = "monitor";
-const WXPUSHER_URL: &str = "https://wxpusher.zjiecode.com/api/send/message";
+const WXPUSHER_STANDARD_URL: &str = "https://wxpusher.zjiecode.com/api/send/message";
+const WXPUSHER_SIMPLE_URL: &str = "https://wxpusher.zjiecode.com/api/send/message/simple-push";
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -57,6 +58,15 @@ struct WxMessage<'a> {
     summary: &'a str,
     content_type: u8,
     uids: [&'a str; 1],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WxSimpleMessage<'a> {
+    spt: &'a str,
+    content: &'a str,
+    summary: &'a str,
+    content_type: u8,
 }
 
 fn manifest() -> Result<Manifest, gateway_plugin_sdk::ManifestError> {
@@ -255,16 +265,33 @@ async fn send_wxpusher(
     summary: &str,
     content: &str,
 ) -> Result<(), PluginFault> {
-    let body = serde_json::to_vec(&WxMessage {
-        app_token: &configuration.app_token,
-        content,
-        summary,
-        content_type: 1,
-        uids: [&configuration.uid],
-    }).map_err(|_| fault("无法编码 WxPusher 请求"))?;
+    let simple = configuration.app_token.starts_with("SPT_");
+    let (url, body) = if simple {
+        (
+            WXPUSHER_SIMPLE_URL,
+            serde_json::to_vec(&WxSimpleMessage {
+                spt: &configuration.app_token,
+                content,
+                summary,
+                content_type: 1,
+            }),
+        )
+    } else {
+        (
+            WXPUSHER_STANDARD_URL,
+            serde_json::to_vec(&WxMessage {
+                app_token: &configuration.app_token,
+                content,
+                summary,
+                content_type: 1,
+                uids: [&configuration.uid],
+            }),
+        )
+    };
+    let body = body.map_err(|_| fault("无法编码 WxPusher 请求"))?;
     let response = host.http(HttpRequest {
         method: "POST".to_owned(),
-        url: WXPUSHER_URL.to_owned(),
+        url: url.to_owned(),
         headers: vec![("content-type".to_owned(), b"application/json".to_vec())],
     }, body).await?;
     let status = response.status;
