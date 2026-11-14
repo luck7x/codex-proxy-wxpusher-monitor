@@ -3,7 +3,7 @@
   "name": "wxpusher-account-monitor",
   "displayName": "WxPusher 账号授权监控",
   "publisher": "luck7x",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "监控 OpenAI OAuth 账号凭据状态，并通过 WxPusher 推送授权失效与恢复通知",
   "license": "MIT",
   "author": "luck7x",
@@ -40,6 +40,16 @@
         "type": "boolean",
         "default": true,
         "title": "首次启用时发送测试消息"
+      },
+      "accountLabels": {
+        "type": "object",
+        "default": {},
+        "title": "账号备注映射",
+        "additionalProperties": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
       }
     },
     "additionalProperties": false

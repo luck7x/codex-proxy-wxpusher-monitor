@@ -12,6 +12,7 @@ use gateway_plugin_sdk::{
         SessionError, TypedCall, TypedReply, methods,
     },
 };
+use chrono::{FixedOffset, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
@@ -20,6 +21,7 @@ const STATE_NAMESPACE: &str = "monitor";
 const STATE_KEY: &str = "monitor";
 const WXPUSHER_STANDARD_URL: &str = "https://wxpusher.zjiecode.com/api/send/message";
 const WXPUSHER_SIMPLE_URL: &str = "https://wxpusher.zjiecode.com/api/send/message/simple-push";
+const SECOND_REMINDER_SECONDS: u64 = 2 * 60 * 60;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -30,6 +32,8 @@ struct Configuration {
     daily_probe_enabled: bool,
     #[serde(default = "enabled")]
     send_startup_message: bool,
+    #[serde(default)]
+    account_labels: BTreeMap<String, String>,
 }
 
 const fn enabled() -> bool { true }
@@ -99,6 +103,7 @@ async fn reconcile(
         .filter(|account| account.enabled && account.authentication_kind == "oauth")
         .map(|account| (account.account_id.clone(), account))
         .collect::<BTreeMap<_, _>>();
+    let pool = active.values().copied().collect::<Vec<_>>();
     state.accounts.retain(|entry| active.contains_key(&entry.account_id));
 
     for account in active.values() {
@@ -116,23 +121,36 @@ async fn reconcile(
                 state.accounts.last_mut().expect("just inserted")
             }
         };
-        entry.state.clone_from(&current);
-        let changed_to_error = !is_healthy(&current) && entry.notified_state != current;
-        let recovered = is_healthy(&current)
-            && !entry.notified_state.is_empty()
-            && !is_healthy(&entry.notified_state);
-        if changed_to_error || recovered {
-            let content = notification_content(account, &current, recovered);
-            send_wxpusher(
-                &call.host,
-                &configuration,
-                if recovered { "Codex 账号已恢复" } else { "Codex 账号授权告警" },
-                &content,
-            ).await?;
-            entry.notified_state.clone_from(&current);
-        } else if is_healthy(&current) && entry.notified_state.is_empty() {
+        let previous = entry.state.clone();
+        let now = epoch_seconds();
+        let marker = parse_alert_marker(&entry.notified_state);
+        if !is_healthy(&current) {
+            match marker {
+                None => {
+                    let title = format!("【OAuth 授权失效 1/2】{}", account_label(account, &configuration));
+                    let content = failure_content(account, &current, 1, &pool, &configuration);
+                    send_wxpusher(&call.host, &configuration, &title, &content).await?;
+                    entry.notified_state = format!("alert:1:{now}");
+                }
+                Some(marker) if marker.count == 1
+                    && now.saturating_sub(marker.first_at) >= SECOND_REMINDER_SECONDS =>
+                {
+                    let title = format!("【仍需重新授权 2/2】{}", account_label(account, &configuration));
+                    let content = failure_content(account, &current, 2, &pool, &configuration);
+                    send_wxpusher(&call.host, &configuration, &title, &content).await?;
+                    entry.notified_state = format!("alert:2:{}", marker.first_at);
+                }
+                _ => {}
+            }
+        } else if current == "ready" && marker.is_some() && previous == "ready" {
+            let title = format!("【OAuth 已恢复】{}", account_label(account, &configuration));
+            let content = recovery_content(account, &pool, &configuration);
+            send_wxpusher(&call.host, &configuration, &title, &content).await?;
+            entry.notified_state = "ready".to_owned();
+        } else if marker.is_none() && entry.notified_state.is_empty() {
             entry.notified_state.clone_from(&current);
         }
+        entry.state.clone_from(&current);
     }
 
     if !state.initialized {
@@ -175,24 +193,100 @@ fn is_healthy(state: &str) -> bool {
     matches!(state, "ready" | "unknown")
 }
 
-fn notification_content(account: &AuthRuntimeAccount, state: &str, recovered: bool) -> String {
-    let identity = account.email.as_deref().unwrap_or(&account.name);
-    let suffix = account.account_id.rsplit('_').next().unwrap_or(&account.account_id);
-    if recovered {
-        format!("账号：{identity}\nID：…{}\n状态：已恢复，可正常使用。", tail(suffix, 8))
-    } else {
-        let action = match state {
-            "expired" | "invalid" | "missing_refresh_token" => "请进入账号管理完成重新授权。",
-            "banned" => "账号可能已被上游封禁，请人工检查。",
-            _ => "请进入账号管理检查凭据。",
-        };
-        format!("账号：{identity}\nID：…{}\n异常：{state}\n{action}", tail(suffix, 8))
-    }
+#[derive(Clone, Copy)]
+struct AlertMarker {
+    count: u8,
+    first_at: u64,
 }
 
-fn tail(value: &str, count: usize) -> &str {
-    let start = value.char_indices().rev().nth(count.saturating_sub(1)).map_or(0, |(index, _)| index);
-    &value[start..]
+fn parse_alert_marker(value: &str) -> Option<AlertMarker> {
+    let mut parts = value.split(':');
+    if parts.next()? != "alert" {
+        return None;
+    }
+    let count = parts.next()?.parse().ok()?;
+    let first_at = parts.next()?.parse().ok()?;
+    Some(AlertMarker { count, first_at })
+}
+
+fn account_label<'a>(account: &'a AuthRuntimeAccount, configuration: &'a Configuration) -> &'a str {
+    configuration
+        .account_labels
+        .get(&account.account_id)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or(account.email.as_deref())
+        .unwrap_or(&account.name)
+}
+
+fn pool_status(accounts: &[&AuthRuntimeAccount], configuration: &Configuration) -> String {
+    let healthy = accounts
+        .iter()
+        .filter(|account| is_healthy(&effective_state(account)))
+        .count();
+    let abnormal = accounts.len().saturating_sub(healthy);
+    let mut output = format!("账号池状态：{healthy} 正常 / {abnormal} 异常 / 共 {} 个\n\n", accounts.len());
+    for account in accounts {
+        let state = effective_state(account);
+        let label = account_label(account, configuration);
+        if is_healthy(&state) {
+            output.push_str(&format!("✅ {label}\n"));
+        } else {
+            output.push_str(&format!("❌ {label}（{state}）\n"));
+        }
+    }
+    output.trim_end().to_owned()
+}
+
+fn failure_content(
+    account: &AuthRuntimeAccount,
+    state: &str,
+    reminder: u8,
+    pool: &[&AuthRuntimeAccount],
+    configuration: &Configuration,
+) -> String {
+    let label = account_label(account, configuration);
+    let email = account.email.as_deref().unwrap_or("未记录");
+    let action = match state {
+        "expired" | "invalid" | "missing_refresh_token" => "请进入账号管理完成 OAuth 重新授权。",
+        "banned" => "账号可能已被上游封禁，请人工检查。",
+        _ => "请进入账号管理检查凭据。",
+    };
+    let reminder_text = if reminder == 1 {
+        "若 2 小时后仍未恢复，将发送第 2 次也是最后一次提醒。"
+    } else {
+        "这是本次故障的最后一次提醒，之后不会重复推送。"
+    };
+    format!(
+        "发现时间：{}\n账号备注：{label}\n登录邮箱：{email}\n当前状态：{state}\n处理建议：{action}\n\n{}\n\n{reminder_text}",
+        beijing_time(),
+        pool_status(pool, configuration)
+    )
+}
+
+fn recovery_content(
+    account: &AuthRuntimeAccount,
+    pool: &[&AuthRuntimeAccount],
+    configuration: &Configuration,
+) -> String {
+    let label = account_label(account, configuration);
+    let email = account.email.as_deref().unwrap_or("未记录");
+    format!(
+        "恢复时间：{}\n账号备注：{label}\n登录邮箱：{email}\n当前状态：ready\n结果：重新授权成功，账号已重新加入账号池。\n\n{}",
+        beijing_time(),
+        pool_status(pool, configuration)
+    )
+}
+
+fn beijing_time() -> String {
+    let offset = FixedOffset::east_opt(8 * 60 * 60).expect("valid UTC+8 offset");
+    Utc::now().with_timezone(&offset).format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn epoch_day() -> i64 {

@@ -9,8 +9,9 @@ Tokens beginning with `SPT_` automatically use WxPusher's simple-push endpoint. 
 Features:
 
 - checks account credential state every maintenance cycle;
-- notifies once when an account becomes expired, invalid, banned, or loses its refresh token;
-- notifies once when an account recovers;
+- sends an immediate failure notification and one final reminder after two hours if the account is still unhealthy;
+- waits for two consecutive `ready` observations before sending one recovery notification;
+- includes the complete account-pool status and uses locally configured account notes when available;
 - probes one account per cycle through the non-conversation quota endpoint, at most once per UTC day;
 - stores notification and probe state in the host-managed private plugin state.
 

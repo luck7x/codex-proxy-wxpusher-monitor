@@ -1,12 +1,13 @@
 [package]
 name = "codex-proxy-wxpusher-monitor"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
 rust-version = "1.99.1"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", tag = "v3.29.7", features = ["io"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
